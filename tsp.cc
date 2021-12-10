@@ -1,23 +1,21 @@
-/*OLD TSP DO NOT ADD*/
-
-
-
 /*
  * Main file for Traveling-Salesperson solver.
- * Read a cities file in .tsv format into a Cities object, then run
+ * Read a cities file in TSV format into a Cities object, then run
  * of several solver algorithms on it and output the best result.
  */
 
 #include "cities.hh"
 #include "tournament_deme.hh"
-#include "climb_chromosome.hh"
 
+#include <atomic>
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
 #include <fstream>
 #include <numeric>
+#include <thread>
+#include <mutex>
 
 //////////////////////////////////////////////////////////////////////////////
 // Check whether a specific ordering reduces the total path distance in cities
@@ -58,6 +56,82 @@ randomized_search(const Cities& cities, uint64_t niter)
   return best_ordering;
 }
 
+
+//////////////////////////////////////////////////////////////////////////////
+// threaded_randomized_search is a multi-threaded wrapper of exhaustive_search
+Cities::permutation_t
+threaded_randomized_search(const Cities& cities,
+                           uint64_t niter,
+                           unsigned nthread = 1)
+{
+  auto best_ordering = Cities::permutation_t(cities.size());
+  auto best_mutex = std::mutex();
+
+  auto run_one_thread = [&]() {
+    auto my_best = randomized_search(cities, niter / nthread);
+    {
+      auto guard = std::scoped_lock(best_mutex);
+      // Repeat check, maybe something changed:
+      if (cities.total_path_distance(my_best) < cities.total_path_distance(best_ordering)) {
+        best_ordering = my_best;
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  for (unsigned i = 0; i < nthread; ++i) {
+    threads.push_back(std::thread(run_one_thread));
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  return best_ordering;
+
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// granular_exhaustive_search is a multi-threaded wrapper of exhaustive_search
+// Unliked threaded_randomized search, you can set the granularity of each
+// search step in this function.
+Cities::permutation_t
+granular_randomized_search(const Cities& cities,
+                           uint64_t niter,
+                           unsigned nthread = 1,
+                           unsigned granularity = 100)
+{
+  auto best_ordering = Cities::permutation_t(cities.size());
+  auto best_mutex = std::mutex();
+  std::atomic<unsigned> evaluated = 0;
+
+  auto run_one_thread = [&]() {
+    while (evaluated < niter) {
+      auto my_best = randomized_search(cities, granularity);
+      evaluated += granularity;
+      {
+        auto guard = std::scoped_lock(best_mutex);
+        // Repeat check, maybe something changed:
+        if (cities.total_path_distance(my_best) < cities.total_path_distance(best_ordering)) {
+          best_ordering = my_best;
+        }
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  for (unsigned i = 0; i < nthread; ++i) {
+    threads.push_back(std::thread(run_one_thread));
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  return best_ordering;
+
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // exhaustive_search searches every single permutation of the cities.
 // The best cities permutation is returned.
@@ -95,15 +169,13 @@ Cities::permutation_t
 ga_search(const Cities& cities,
           unsigned iters,
           unsigned pop_size,
-          double mutation_rate, unsigned p)
+          double mutation_rate,
+          unsigned nthread = 1)
 {
-  auto best_dist = 1e100;
+  auto best_dist = 1e100 + nthread; // Eliminate silly warning
   auto best_ordering = Cities::permutation_t(cities.size());
 
-  TournamentDeme deme(&cities, pop_size, mutation_rate, p);
-
-  //Deme deme(&cities, pop_size, mutation_rate);
-  // ^ regular deme
+  TournamentDeme deme(&cities, pop_size, mutation_rate);
 
   // Evolve the population to make it fitter and keep track of
   // the shortest distance generated
@@ -123,7 +195,7 @@ ga_search(const Cities& cities,
 //////////////////////////////////////////////////////////////////////////////
 int main(int argc, char** argv)
 {
-  if (argc != 5) {
+  if (argc < 4) {
     std::cerr << "Required arguments: filename for cities, population size, and mutation rate\n";
     return -1;
   }
@@ -131,20 +203,19 @@ int main(int argc, char** argv)
   const auto cities = Cities(argv[1]);
   const auto pop_size = atoi(argv[2]);
   const auto mut_rate = atof(argv[3]);
-  constexpr unsigned NUM_ITER = 100000;
+  const auto nthread = (argc > 4)? atoi(argv[4]) : 1;
+  const auto granularity = (argc > 5)? atoi(argv[5]) : 100;
 
-  // p argument necessary if using TournamentDeme
-  const unsigned p = atof(argv[4]);
-
+  constexpr unsigned NUM_ITER = 4'000'000;
   assert(cities.size() > 0 && "Did you actually read the input file successfully?");
 
 
- //const auto best_ordering = exhaustive_search(cities);
- //const auto best_ordering = randomized_search(cities, NUM_ITER);
-  const auto best_ordering = ga_search(cities, NUM_ITER, pop_size, mut_rate, p);
+//  const auto best_ordering = exhaustive_search(cities);
+//  const auto best_ordering = randomized_search(cities, NUM_ITER);
+  const auto best_ordering = threaded_randomized_search(cities, NUM_ITER, nthread);
+//  const auto best_ordering = granular_randomized_search(cities, NUM_ITER, nthread, granularity);
+//  const auto best_ordering = ga_search(cities, NUM_ITER, pop_size, mut_rate, nthread);
 
-
-  // Save file
   auto out = std::ofstream("shortest.tsv");
   if (!out.is_open()) {
     std::cerr << "Can't open output file to record shortest path!\n";
@@ -153,5 +224,6 @@ int main(int argc, char** argv)
 
   out << cities.reorder(best_ordering);
 
-  return 0;
+  return pop_size - mut_rate + nthread - granularity; // eliminate silly warning
 }
+
